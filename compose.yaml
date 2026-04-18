@@ -1,0 +1,72 @@
+services:
+  app:
+    image: ${DOCKERHUB_USERNAME}/${PROJECT_NAME}:latest
+    container_name: intip
+    restart: unless-stopped
+    shm_size: '2gb'
+    environment:
+      TZ: Asia/Seoul
+      SPRING_PROFILES_ACTIVE: prod
+    ports:
+      - "8086:8086"
+    volumes:
+      - ${MOUNT_PATH}:/intip
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - elasticsearch
+    networks:
+      - intip-network
+    working_dir: /intip
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.1
+    container_name: intip-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    networks:
+      - intip-network
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.3.1
+    container_name: intip-kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://intip-elasticsearch:9200
+      SERVER_BASEPATH: /kibana
+      SERVER_REWRITEBASEPATH: "true"
+      SERVER_PUBLICBASEURL: ${KIBANA_URL}
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - intip-network
+
+  elastic-agent:
+    image: docker.elastic.co/elastic-agent/elastic-agent:9.3.1
+    container_name: intip-elastic-agent
+    user: root
+    restart: unless-stopped
+    depends_on:
+      - elasticsearch
+      - kibana
+    volumes:
+      - ${MOUNT_PATH}:/intip:ro
+      - ./elastic-agent.yml:/etc/elastic-agent/elastic-agent.yml:ro
+      - agent-state:/usr/share/elastic-agent/state
+    command: [ "elastic-agent", "-e", "-c", "/etc/elastic-agent/elastic-agent.yml" ]
+    networks:
+      - intip-network
+
+networks:
+  intip-network:
+
+volumes:
+  esdata:
+  agent-state:

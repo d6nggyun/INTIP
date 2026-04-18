@@ -1,117 +1,144 @@
 package kr.inuappcenterportal.inuportal.domain.member.service;
 
-import kr.inuappcenterportal.inuportal.domain.firebase.service.FcmService;
 import kr.inuappcenterportal.inuportal.domain.member.dto.LoginDto;
 import kr.inuappcenterportal.inuportal.domain.member.dto.MemberResponseDto;
 import kr.inuappcenterportal.inuportal.domain.member.dto.MemberUpdateNicknameDto;
 import kr.inuappcenterportal.inuportal.domain.member.dto.TokenDto;
 import kr.inuappcenterportal.inuportal.domain.member.model.Member;
 import kr.inuappcenterportal.inuportal.domain.member.repository.MemberRepository;
+import kr.inuappcenterportal.inuportal.domain.member.repository.SchoolLoginRepository;
 import kr.inuappcenterportal.inuportal.domain.notice.enums.Department;
 import kr.inuappcenterportal.inuportal.global.config.TokenProvider;
 import kr.inuappcenterportal.inuportal.global.exception.ex.MyErrorCode;
 import kr.inuappcenterportal.inuportal.global.exception.ex.MyException;
-import kr.inuappcenterportal.inuportal.domain.member.repository.SchoolLoginRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
-
 @Service
 @RequiredArgsConstructor
 @Transactional(readOnly = true)
 public class MemberService {
+    private static final long LAST_SEEN_UPDATE_THRESHOLD_MINUTES = 5L;
+
     private final MemberRepository memberRepository;
     private final TokenProvider tokenProvider;
     private final SchoolLoginRepository schoolLoginRepository;
 
-
     @Transactional
-    public Long updateMemberNicknameFireId(Long id, MemberUpdateNicknameDto memberUpdateNicknameDto){
-        Member member = memberRepository.findById(id).orElseThrow(()->new MyException(MyErrorCode.USER_NOT_FOUND));
-        if(memberUpdateNicknameDto.getNickname()!=null) {
+    public Long updateMemberNicknameFireId(Long id, MemberUpdateNicknameDto memberUpdateNicknameDto) {
+        Member member = memberRepository.findById(id).orElseThrow(() -> new MyException(MyErrorCode.USER_NOT_FOUND));
+        if (memberUpdateNicknameDto.getNickname() != null) {
             if (memberRepository.existsByNickname(memberUpdateNicknameDto.getNickname())) {
                 throw new MyException(MyErrorCode.USER_DUPLICATE_NICKNAME);
             }
-            if(memberUpdateNicknameDto.getNickname().trim().isEmpty()){
+            if (memberUpdateNicknameDto.getNickname().trim().isEmpty()) {
                 throw new MyException(MyErrorCode.NOT_BLANK_NICKNAME);
             }
-            if(memberUpdateNicknameDto.getFireId()!=null){
-                member.updateNicknameAndFire(memberUpdateNicknameDto.getNickname(),memberUpdateNicknameDto.getFireId());
-            }
-            else{
+            if (memberUpdateNicknameDto.getFireId() != null) {
+                member.updateNicknameAndFire(memberUpdateNicknameDto.getNickname(), memberUpdateNicknameDto.getFireId());
+            } else {
                 member.updateNickName(memberUpdateNicknameDto.getNickname());
             }
-        }else if(memberUpdateNicknameDto.getFireId()!=null){
+        } else if (memberUpdateNicknameDto.getFireId() != null) {
             member.updateFire(memberUpdateNicknameDto.getFireId());
-        }
-        else{
+        } else {
             throw new MyException(MyErrorCode.EMPTY_REQUEST);
         }
         return member.getId();
     }
 
     @Transactional
-    public void delete(Member member){
+    public void delete(Member member) {
         memberRepository.delete(member);
     }
 
-    public TokenDto login(Member member){
+    public TokenDto login(Member member) {
         LocalDateTime localDateTime = LocalDateTime.now();
-        long tokenValidMillisecond = 1000L * 60 * 60 * 24 ;//24시간
-        long refreshValidMillisecond = 1000L * 60 *60 *24 * 7;//7일
-        String accessToken = tokenProvider.createToken(member.getId().toString(),member.getRoles(),localDateTime);
-        String refreshToken = tokenProvider.createRefreshToken(member.getId().toString(),localDateTime);
-        return TokenDto.of(accessToken,refreshToken,localDateTime.plus(Duration.ofMillis(tokenValidMillisecond)).toString(),localDateTime.plus(Duration.ofMillis(refreshValidMillisecond)).toString());
+        String accessToken = tokenProvider.createToken(member.getId().toString(), member.getRoles(), localDateTime);
+        String refreshToken = tokenProvider.createRefreshToken(member.getId().toString(), localDateTime);
+        return TokenDto.of(
+                accessToken,
+                refreshToken,
+                tokenProvider.getAccessTokenExpiry(localDateTime).toString(),
+                tokenProvider.getRefreshTokenExpiry(localDateTime).toString()
+        );
     }
 
-    public TokenDto refreshToken(String token){
-        if(!tokenProvider.validateRefreshToken(token)){
+    public TokenDto refreshToken(String token) {
+        if (!tokenProvider.validateRefreshToken(token)) {
             throw new MyException(MyErrorCode.EXPIRED_TOKEN);
         }
         Long id = Long.valueOf(tokenProvider.getUsernameByRefresh(token));
-        Member member = memberRepository.findById(id).orElseThrow(()->new MyException(MyErrorCode.USER_NOT_FOUND));
+        Member member = memberRepository.findById(id).orElseThrow(() -> new MyException(MyErrorCode.USER_NOT_FOUND));
         return login(member);
-    }
-
-
-    public MemberResponseDto getMember(Member member){
-        return getMemberResponseDto(member);
-    }
-
-    public List<MemberResponseDto> getAllMember(){
-        return memberRepository.findAll().stream().map(this::getMember).collect(Collectors.toList());
     }
 
     @Transactional
-    public TokenDto schoolLogin(LoginDto loginDto){
-        if (!schoolLoginRepository.loginCheck(loginDto.getStudentId(), loginDto.getPassword())) {
-            throw new MyException(MyErrorCode.STUDENT_LOGIN_ERROR);
-        }
-        if (!memberRepository.existsByStudentId(loginDto.getStudentId())) {
-            createMember(loginDto.getStudentId());
-        }
-        Member member = memberRepository.findByStudentId(loginDto.getStudentId()).orElseThrow(() -> new MyException(MyErrorCode.USER_NOT_FOUND));
-        return login(member);
-
+    public MemberResponseDto getCurrentMember(Member member) {
+        Member persistedMember = findMemberById(member.getId());
+        updateLastSeenAtIfNeeded(persistedMember);
+        return getMemberResponseDto(persistedMember);
     }
 
-    public void createMember(String studentId){
-        Member member = Member.builder().studentId(studentId).roles(Collections.singletonList("ROLE_USER")).build();
-        memberRepository.save(member);
+    public MemberResponseDto getMember(Member member) {
+        return getMemberResponseDto(member);
+    }
+
+    public List<MemberResponseDto> getAllMember() {
+        return memberRepository.findAll().stream().map(this::getMemberResponseDto).collect(Collectors.toList());
+    }
+
+    @Transactional
+    public TokenDto schoolLogin(LoginDto loginDto) {
+        String studentId = loginDto.getStudentId();
+        if (!schoolLoginRepository.loginCheck(studentId, loginDto.getPassword())) {
+            throw new MyException(MyErrorCode.STUDENT_LOGIN_ERROR);
+        }
+
+        List<String> roles = schoolLoginRepository.resolveRoles(studentId);
+        Member member = memberRepository.findByStudentId(studentId)
+                .map(existingMember -> synchronizeRoles(existingMember, roles))
+                .orElseGet(() -> createMember(studentId, roles));
+        return login(member);
+    }
+
+    public void createMember(String studentId) {
+        createMember(studentId, Collections.singletonList("ROLE_USER"));
+    }
+
+    private Member createMember(String studentId, List<String> roles) {
+        Member member = Member.builder().studentId(studentId).roles(roles).build();
+        return memberRepository.save(member);
+    }
+
+    private Member synchronizeRoles(Member member, List<String> roles) {
+        if (shouldPreserveAdminRole(member, roles)) {
+            return member;
+        }
+
+        if (!member.getRoles().equals(roles)) {
+            member.updateRoles(roles);
+            return memberRepository.save(member);
+        }
+        return member;
+    }
+
+    private boolean shouldPreserveAdminRole(Member member, List<String> roles) {
+        return member.getRoles() != null
+                && member.getRoles().contains("ROLE_ADMIN")
+                && (roles == null || !roles.contains("ROLE_ADMIN"));
     }
 
     @Transactional
     public MemberResponseDto updateMemberDepartment(Long memberId, Department department) {
         Member member = findMemberById(memberId);
         member.updateDepartment(department);
-
         return getMemberResponseDto(member);
     }
 
@@ -119,7 +146,6 @@ public class MemberService {
     public MemberResponseDto agreeTerms(Long memberId) {
         Member member = findMemberById(memberId);
         member.agreeTerms();
-
         return getMemberResponseDto(member);
     }
 
@@ -131,8 +157,15 @@ public class MemberService {
         }
     }
 
-    private Member findMemberById(Long id){
+    private void updateLastSeenAtIfNeeded(Member member) {
+        LocalDateTime now = LocalDateTime.now();
+        if (member.shouldUpdateLastSeenAt(now, LAST_SEEN_UPDATE_THRESHOLD_MINUTES)) {
+            member.updateLastSeenAt();
+        }
+    }
+
+    private Member findMemberById(Long id) {
         return memberRepository.findById(id)
-                .orElseThrow(()->new MyException(MyErrorCode.USER_NOT_FOUND));
+                .orElseThrow(() -> new MyException(MyErrorCode.USER_NOT_FOUND));
     }
 }

@@ -24,6 +24,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
 import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -56,10 +57,14 @@ public class MemberServiceTest {
         Member member = createMember(studentId);
         LoginDto loginDto = LoginDto.builder().studentId(studentId).password(password).build();
         when(schoolLoginRepository.loginCheck(studentId,password)).thenReturn(true);
-        when(memberRepository.existsByStudentId(studentId)).thenReturn(false);
+        when(schoolLoginRepository.resolveRoles(studentId)).thenReturn(Collections.singletonList("ROLE_USER"));
         when(memberRepository.findByStudentId(studentId)).thenReturn(Optional.ofNullable(member));
         when(tokenProvider.createToken(eq("1"),eq(member.getRoles()), any(LocalDateTime.class))).thenReturn("testAccessToken");
         when(tokenProvider.createRefreshToken(eq("1"), any(LocalDateTime.class))).thenReturn("testRefreshToken");
+        when(tokenProvider.getAccessTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusDays(1));
+        when(tokenProvider.getRefreshTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusMonths(6));
 
         //when
         TokenDto tokenDto = memberService.schoolLogin(loginDto);
@@ -72,8 +77,35 @@ public class MemberServiceTest {
         );
 
         verify(schoolLoginRepository,times(1)).loginCheck(studentId,password);
-        verify(memberRepository, times(1)).existsByStudentId(studentId);
+        verify(schoolLoginRepository,times(1)).resolveRoles(studentId);
         verify(memberRepository, times(1)).findByStudentId(studentId);
+    }
+
+    @Test
+    @DisplayName("학교 로그인 시 기존 관리자 권한은 유지된다")
+    public void schoolLoginPreservesExistingAdminRole() throws NoSuchFieldException, IllegalAccessException {
+        String studentId = "20241234";
+        String password = "12345";
+        LoginDto loginDto = LoginDto.builder().studentId(studentId).password(password).build();
+        Member member = createMember(studentId);
+        ReflectionTestUtils.setField(member, "roles", Collections.singletonList("ROLE_ADMIN"));
+
+        when(schoolLoginRepository.loginCheck(studentId, password)).thenReturn(true);
+        when(schoolLoginRepository.resolveRoles(studentId)).thenReturn(Collections.singletonList("ROLE_USER"));
+        when(memberRepository.findByStudentId(studentId)).thenReturn(Optional.of(member));
+        when(tokenProvider.createToken(eq("1"), eq(List.of("ROLE_ADMIN")), any(LocalDateTime.class))).thenReturn("testAccessToken");
+        when(tokenProvider.createRefreshToken(eq("1"), any(LocalDateTime.class))).thenReturn("testRefreshToken");
+        when(tokenProvider.getAccessTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusDays(1));
+        when(tokenProvider.getRefreshTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusMonths(6));
+
+        TokenDto tokenDto = memberService.schoolLogin(loginDto);
+
+        assertEquals("testAccessToken", tokenDto.getAccessToken());
+        assertEquals(List.of("ROLE_ADMIN"), member.getRoles());
+
+        verify(memberRepository, never()).save(any(Member.class));
     }
 
     @Test
@@ -115,6 +147,10 @@ public class MemberServiceTest {
         Member member = createMember(studentId);
         when(tokenProvider.createToken(eq("1"),eq(member.getRoles()), any(LocalDateTime.class))).thenReturn("testAccessToken");
         when(tokenProvider.createRefreshToken(eq("1"), any(LocalDateTime.class))).thenReturn("testRefreshToken");
+        when(tokenProvider.getAccessTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusDays(1));
+        when(tokenProvider.getRefreshTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusMonths(6));
 
         //when
         TokenDto tokenDto = memberService.login(member);
@@ -145,6 +181,10 @@ public class MemberServiceTest {
         Member member = createMember(studentId);
         when(tokenProvider.createToken(eq("1"),eq(member.getRoles()), any(LocalDateTime.class))).thenReturn("testAccessToken");
         when(tokenProvider.createRefreshToken(eq("1"), any(LocalDateTime.class))).thenReturn("testRefreshToken");
+        when(tokenProvider.getAccessTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusDays(1));
+        when(tokenProvider.getRefreshTokenExpiry(any(LocalDateTime.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0, LocalDateTime.class).plusMonths(6));
         when(memberRepository.findById(1L)).thenReturn(Optional.of(member));
 
         //when

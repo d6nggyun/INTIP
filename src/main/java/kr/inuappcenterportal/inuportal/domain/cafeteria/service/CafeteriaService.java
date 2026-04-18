@@ -28,11 +28,11 @@ public class CafeteriaService {
     @Value("${installPath}")
     private String installPath;
 
-    /*@PostConstruct
+    @PostConstruct
     @Transactional
     public void initCafeteria() throws InterruptedException {
         crawlCafeteria();
-    }*/
+    }
 
     @Scheduled(cron = "0 10 0 ? * MON-SAT")
     @Transactional
@@ -57,7 +57,8 @@ public class CafeteriaService {
 
 
     public void crawlCafeteria() throws InterruptedException {
-        System.setProperty("webdriver.chrome.driver", installPath);
+//        System.setProperty("webdriver.chrome.driver", installPath);  //셀레니움(Selenium) 버전이 4.6.0 이상이면 자동으로 수행되므로 필요없음
+
         ChromeOptions options = new ChromeOptions();
         options.addArguments("--remote-allow-origins=*");
         options.addArguments("headless");

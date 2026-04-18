@@ -171,3 +171,10 @@ gradle-app.setting
 *.hprof
 
 # End of https://www.toptal.com/developers/gitignore/api/intellij,java,gradle
+
+.gradle/
+.gradle-user/
+build/
+
+#/instagram-2gisik-scrapping/chrome-profile/
+/instagram-2gisik-scrapping/output/
