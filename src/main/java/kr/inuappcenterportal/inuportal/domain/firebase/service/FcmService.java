@@ -31,12 +31,14 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.PreparedStatement;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -57,6 +59,8 @@ public class FcmService {
     private final FcmAsyncExecutor fcmAsyncExecutor;
     private final FirebaseMessaging firebaseMessaging;
     private final MemberRepository memberRepository;
+    private final JdbcTemplate jdbcTemplate;
+    private final FcmTransactionService fcmTransactionService;
 
     @Transactional
     public void saveToken(TokenRequestDto tokenRequestDto, Long memberId) {
@@ -169,15 +173,29 @@ public class FcmService {
     }
 
     @Transactional
-    public void sendKeywordNotice(Map<String, Long> tokenAndMemberId, String title, String body) {
+    public Long prepareKeywordNotice(Map<String, Long> tokenAndMemberId, String title, String body, FcmMessageType fcmMessageType) {
         if (tokenAndMemberId.isEmpty()) {
-            return;
+            return null;
         }
 
         FcmMessage fcmMessage = saveTrackedMessage(title, body, false, tokenAndMemberId.size());
-        DeliveryResult deliveryResult = dispatchToMembers(tokenAndMemberId, title, body, fcmMessage, FcmMessageType.DEPARTMENT);
-        saveMemberFcmMessages(deliveryResult.memberFcmMessages());
-        fcmMessage.updateDeliveryResult(deliveryResult.successCount(), deliveryResult.failureCount());
+
+        List<Long> targetMemberIds = tokenAndMemberId.values().stream()
+                .filter(id -> id != null && !id.equals(UNLINKED_MEMBER_ID))
+                .distinct()
+                .toList();
+
+        batchInsertMemberFcmMessages(fcmMessage.getId(), targetMemberIds, fcmMessageType);
+
+        return fcmMessage.getId();
+    }
+
+    public void dispatchKeywordNotice(Long fcmMessageId, Map<String, Long> tokenAndMemberId, String title, String body) {
+        if (fcmMessageId == null || tokenAndMemberId.isEmpty()) {
+            return;
+        }
+        DeliveryResult deliveryResult = dispatchToMembersInternal(fcmMessageId, tokenAndMemberId, title, body);
+        fcmTransactionService.updateFinalStatus(fcmMessageId, deliveryResult.successCount(), deliveryResult.failureCount());
     }
 
     @Transactional
@@ -199,42 +217,168 @@ public class FcmService {
         );
     }
 
-    @Transactional
+    /**
+     * 비동기로 실행되며, 전체 트랜잭션 없이 각 단계별로 트랜잭션을 분리하여 처리합니다.
+     */
     public void sendToMembers(AdminNotificationDispatch dispatch) {
-        FcmMessage fcmMessage = fcmMessageRepository.findById(dispatch.fcmMessageId())
-                .orElseThrow(() -> new MyException(MyErrorCode.MESSAGE_NOT_FOUND));
+        // 1. 상태를 PROCESSING으로 변경
+        fcmTransactionService.updateStatusToProcessing(dispatch.fcmMessageId());
 
-        saveMemberFcmMessages(createMemberFcmMessages(
-                fcmMessage.getId(),
-                dispatch.targetMemberIds(),
-                FcmMessageType.GENERAL
-        ));
+        // 2. 수신 이력 대량 저장 (JdbcTemplate 사용)
+        if (!dispatch.targetMemberIds().isEmpty()) {
+            batchInsertMemberFcmMessages(dispatch.fcmMessageId(), dispatch.targetMemberIds(), FcmMessageType.GENERAL);
+        }
 
         if (!dispatch.hasTarget()) {
-            log.info("Admin member notification stored without push targets: memberTargets={}",
-                    dispatch.memberTargetCount());
+            log.info("Admin member notification stored without push targets: fcmMessageId={}, memberTargets={}",
+                    dispatch.fcmMessageId(), dispatch.memberTargetCount());
+            fcmTransactionService.updateFinalStatus(dispatch.fcmMessageId(), 0, 0);
             return;
         }
 
         try {
-            DeliveryResult deliveryResult = dispatchToMembers(
+            // 3. 실제 FCM 발송 및 실시간 카운트 업데이트
+            DeliveryResult deliveryResult = dispatchToMembersInternal(
+                    dispatch.fcmMessageId(),
                     dispatch.tokenAndMemberId(),
                     dispatch.title(),
-                    dispatch.content(),
-                    fcmMessage,
-                    FcmMessageType.GENERAL
+                    dispatch.content()
             );
 
-            fcmMessage.updateDeliveryResult(deliveryResult.successCount(), deliveryResult.failureCount());
+            // 4. 최종 상태 업데이트
+            fcmTransactionService.updateFinalStatus(dispatch.fcmMessageId(), deliveryResult.successCount(), deliveryResult.failureCount());
 
-            log.info("Admin member notification finished: target={}, success={}, failure={}",
-                    dispatch.targetCount(), deliveryResult.successCount(), deliveryResult.failureCount());
+            log.info("Admin member notification finished: fcmMessageId={}, target={}, success={}, failure={}",
+                    dispatch.fcmMessageId(), dispatch.targetCount(), deliveryResult.successCount(), deliveryResult.failureCount());
         } catch (Exception e) {
-            fcmMessage.markFailed(dispatch.targetCount());
             log.error("Admin member notification failed: fcmMessageId={}, target={}, message={}",
                     dispatch.fcmMessageId(), dispatch.targetCount(), e.getMessage(), e);
+            fcmTransactionService.markAsFailed(dispatch.fcmMessageId(), dispatch.targetCount());
         }
     }
+
+    private void batchInsertMemberFcmMessages(Long fcmMessageId, List<Long> memberIds, FcmMessageType type) {
+        List<Long> distinctIds = distinctMemberIds(memberIds);
+        if (distinctIds.isEmpty()) return;
+
+        String sql = "INSERT INTO member_fcm_message (fcm_message_id, member_id, fcm_message_type, create_date, modified_date) VALUES (?, ?, ?, ?, ?)";
+        LocalDateTime now = LocalDateTime.now();
+
+        jdbcTemplate.batchUpdate(sql, distinctIds, 500, (PreparedStatement ps, Long memberId) -> {
+            ps.setLong(1, fcmMessageId);
+            ps.setLong(2, memberId);
+            ps.setString(3, type.name());
+            ps.setObject(4, now);
+            ps.setObject(5, now);
+        });
+    }
+
+    private DeliveryResult dispatchToMembersInternal(Long fcmMessageId, Map<String, Long> tokenAndMemberId, String title, String body) {
+        List<String> tokens = new ArrayList<>(tokenAndMemberId.keySet());
+        int batchSize = 500;
+        int successCount = 0;
+        int failureCount = 0;
+
+        for (int i = 0; i < tokens.size(); i += batchSize) {
+            List<String> batchTokens = tokens.subList(i, Math.min(i + batchSize, tokens.size()));
+            MulticastMessage message = createMulticastMessage(batchTokens, title, body);
+
+            int batchSuccess = 0;
+            int batchFailure = 0;
+
+            try {
+                BatchResponse response = firebaseMessaging.sendEachForMulticast(message);
+                batchSuccess = response.getSuccessCount();
+                batchFailure = response.getFailureCount();
+
+                List<SendResponse> responses = response.getResponses();
+                for (int j = 0; j < responses.size(); j++) {
+                    SendResponse sendResponse = responses.get(j);
+                    if (!sendResponse.isSuccessful()) {
+                        String token = batchTokens.get(j);
+                        FirebaseMessagingException exception = sendResponse.getException();
+                        log.warn("FCM send failed: token={}, error={}", token, exception != null ? exception.getMessage() : "unknown");
+                    }
+                }
+            } catch (Exception e) {
+                batchFailure = batchTokens.size();
+                log.error("FCM batch send failed: fcmMessageId={}, batchSize={}, message={}", fcmMessageId, batchTokens.size(), e.getMessage());
+            }
+
+            successCount += batchSuccess;
+            failureCount += batchFailure;
+            // 각 배치마다 즉시 DB에 반영
+            fcmTransactionService.updateIncrementalResult(fcmMessageId, batchSuccess, batchFailure);
+        }
+
+        return new DeliveryResult(successCount, failureCount);
+    }
+
+    /**
+     * DB에 이력을 남기지 않고 여러 사용자에게 알림을 보냅니다.
+     * @param memberIds 대상 사용자 ID 목록
+     * @param title 알림 제목
+     * @param body 알림 내용
+     */
+    @Transactional(readOnly = true)
+    public void sendUntrackedNotification(List<Long> memberIds, String title, String body) {
+        if (memberIds == null || memberIds.isEmpty()) {
+            return;
+        }
+        List<FcmToken> tokens = fcmTokenRepository.findFcmTokensByMemberIds(memberIds);
+        if (tokens.isEmpty()) {
+            return;
+        }
+
+        Map<String, Long> tokenAndMemberId = tokens.stream()
+                .collect(Collectors.toMap(
+                        FcmToken::getToken,
+                        FcmToken::getMemberId,
+                        (existing, replacement) -> existing,
+                        LinkedHashMap::new
+                ));
+
+        DeliveryResult deliveryResult = dispatchToMembersInternal(null, tokenAndMemberId, title, body);
+        log.info("Untracked notification sent: targets={}, success={}, failure={}",
+                tokenAndMemberId.size(), deliveryResult.successCount(), deliveryResult.failureCount());
+    }
+
+    /**
+     * DB에 이력을 남기면서(알림함 노출) 푸시 알림을 보냅니다.
+     */
+    @Transactional
+    public TrackedNotificationDispatch prepareTrackedNotification(List<Long> memberIds, String title, String body, FcmMessageType type) {
+        if (memberIds == null || memberIds.isEmpty()) {
+            return null;
+        }
+
+        List<FcmToken> fcmTokens = fcmTokenRepository.findFcmTokensByMemberIds(memberIds);
+        Map<String, Long> tokenAndMemberId = fcmTokens.stream()
+                .collect(Collectors.toMap(
+                        FcmToken::getToken,
+                        fcmToken -> fcmToken.getMemberId() == null ? UNLINKED_MEMBER_ID : fcmToken.getMemberId(),
+                        (existing, replacement) -> existing,
+                        LinkedHashMap::new
+                ));
+
+        FcmMessage fcmMessage = saveTrackedMessage(title, body, false, tokenAndMemberId.size());
+        batchInsertMemberFcmMessages(fcmMessage.getId(), memberIds, type);
+
+        return new TrackedNotificationDispatch(fcmMessage.getId(), tokenAndMemberId, title, body);
+    }
+
+    public void dispatchTrackedNotification(TrackedNotificationDispatch dispatch) {
+        if (dispatch == null) {
+            return;
+        }
+        if (!dispatch.tokenAndMemberId().isEmpty()) {
+            DeliveryResult deliveryResult = dispatchToMembersInternal(dispatch.fcmMessageId(), dispatch.tokenAndMemberId(), dispatch.title(), dispatch.body());
+            fcmTransactionService.updateFinalStatus(dispatch.fcmMessageId(), deliveryResult.successCount(), deliveryResult.failureCount());
+        } else {
+            fcmTransactionService.updateFinalStatus(dispatch.fcmMessageId(), 0, 0);
+        }
+    }
+
 
     @Transactional(readOnly = true)
     public List<AdminNotificationResponse> countAdminFcmMessagesSuccess(int page) {
@@ -288,7 +432,7 @@ public class FcmService {
                 .isAdminMessage(adminMessage)
                 .build();
         fcmMessage.markPending(targetCount);
-        return fcmMessageRepository.save(fcmMessage);
+        return fcmMessageRepository.saveAndFlush(fcmMessage);
     }
 
     private NotificationTargets getAdminNotificationTargets(AdminNotificationRequest request) {
@@ -382,87 +526,6 @@ public class FcmService {
         return fcmTokenRepository.findFcmTokensByMemberIds(memberIds);
     }
 
-    private DeliveryResult dispatchToMembers(Map<String, Long> tokenAndMemberId, String title, String body,
-                                             FcmMessage fcmMessage, FcmMessageType fcmMessageType) {
-        List<String> tokens = new ArrayList<>(tokenAndMemberId.keySet());
-        Map<Long, MemberFcmMessage> uniqueMemberMessages = new LinkedHashMap<>();
-        int batchSize = 500;
-        int successCount = 0;
-        int failureCount = 0;
-
-        for (int i = 0; i < tokens.size(); i += batchSize) {
-            List<String> batchTokens = tokens.subList(i, Math.min(i + batchSize, tokens.size()));
-            MulticastMessage message = createMulticastMessage(batchTokens, title, body);
-
-            try {
-                BatchResponse response = firebaseMessaging.sendEachForMulticast(message);
-                successCount += response.getSuccessCount();
-                failureCount += response.getFailureCount();
-
-                List<SendResponse> responses = response.getResponses();
-                for (int j = 0; j < responses.size(); j++) {
-                    SendResponse sendResponse = responses.get(j);
-                    String token = batchTokens.get(j);
-                    Long memberId = tokenAndMemberId.get(token);
-
-                    if (sendResponse.isSuccessful()) {
-                        if (memberId != null && memberId != UNLINKED_MEMBER_ID) {
-                            uniqueMemberMessages.putIfAbsent(
-                                    memberId,
-                                    MemberFcmMessage.of(fcmMessage.getId(), memberId, fcmMessageType)
-                            );
-                        }
-                        continue;
-                    }
-
-                    FirebaseMessagingException exception = sendResponse.getException();
-                    String errorMsg = exception != null ? exception.getMessage() : "unknown error";
-                    log.warn("FCM send failed: token={}, error={}", token, errorMsg);
-                }
-            } catch (FirebaseMessagingException e) {
-                failureCount += batchTokens.size();
-                log.error("FCM batch send failed: batchSize={}, errorCode={}, message={}",
-                        batchTokens.size(),
-                        e.getMessagingErrorCode(),
-                        e.getMessage(),
-                        e);
-            } catch (Exception e) {
-                failureCount += batchTokens.size();
-                log.error("FCM batch send failed unexpectedly: batchSize={}, message={}",
-                        batchTokens.size(),
-                        e.getMessage(),
-                        e);
-            }
-        }
-
-        return new DeliveryResult(successCount, failureCount, uniqueMemberMessages.values());
-    }
-
-    private void saveMemberFcmMessages(Collection<MemberFcmMessage> memberFcmMessages) {
-        if (memberFcmMessages.isEmpty()) {
-            return;
-        }
-
-        List<MemberFcmMessage> messages = new ArrayList<>(memberFcmMessages);
-        int batchSize = 500;
-        for (int i = 0; i < messages.size(); i += batchSize) {
-            List<MemberFcmMessage> batch = messages.subList(i, Math.min(i + batchSize, messages.size()));
-            memberFcmMessageRepository.saveAll(batch);
-            memberFcmMessageRepository.flush();
-        }
-    }
-
-    private Collection<MemberFcmMessage> createMemberFcmMessages(Long fcmMessageId, List<Long> memberIds,
-                                                                 FcmMessageType fcmMessageType) {
-        if (memberIds == null || memberIds.isEmpty()) {
-            return List.of();
-        }
-
-        return distinctMemberIds(memberIds).stream()
-                .map(memberId -> MemberFcmMessage.of(fcmMessageId, memberId, fcmMessageType))
-                .toList();
-    }
-
     private List<Long> distinctMemberIds(List<Long> memberIds) {
         if (memberIds == null || memberIds.isEmpty()) {
             return List.of();
@@ -476,14 +539,21 @@ public class FcmService {
 
     private record DeliveryResult(
             int successCount,
-            int failureCount,
-            Collection<MemberFcmMessage> memberFcmMessages
+            int failureCount
     ) {
     }
 
     private record NotificationTargets(
             Map<String, Long> tokenAndMemberId,
             List<Long> targetMemberIds
+    ) {
+    }
+
+    public record TrackedNotificationDispatch(
+            Long fcmMessageId,
+            Map<String, Long> tokenAndMemberId,
+            String title,
+            String body
     ) {
     }
 }

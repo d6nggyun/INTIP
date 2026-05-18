@@ -5,6 +5,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.util.List;
 import java.util.Map;
 
 @Service
@@ -14,8 +15,9 @@ public class FcmAsyncService {
     private final FcmService fcmService;
 
     @Async("messageExecutor")
-    public void sendAsyncKeywordNotice(Map<String, Long> tokenAndMemberId, String title, String body) {
-        fcmService.sendKeywordNotice(tokenAndMemberId, title, body);
+    public void sendAsyncKeywordNotice(Map<String, Long> tokenAndMemberId, String title, String body, kr.inuappcenterportal.inuportal.domain.firebase.enums.FcmMessageType fcmMessageType) {
+        Long fcmMessageId = fcmService.prepareKeywordNotice(tokenAndMemberId, title, body, fcmMessageType);
+        fcmService.dispatchKeywordNotice(fcmMessageId, tokenAndMemberId, title, body);
     }
 
     @Async("messageExecutor")
@@ -24,5 +26,16 @@ public class FcmAsyncService {
             return;
         }
         fcmService.sendToMembers(dispatch);
+    }
+
+    @Async("messageExecutor")
+    public void sendAsyncTrackedNotification(List<Long> memberIds, String title, String body, kr.inuappcenterportal.inuportal.domain.firebase.enums.FcmMessageType type) {
+        FcmService.TrackedNotificationDispatch dispatch = fcmService.prepareTrackedNotification(memberIds, title, body, type);
+        fcmService.dispatchTrackedNotification(dispatch);
+    }
+
+    @Async("messageExecutor")
+    public void sendAsyncUntrackedNotification(List<Long> memberIds, String title, String body) {
+        fcmService.sendUntrackedNotification(memberIds, title, body);
     }
 }

@@ -28,9 +28,11 @@ import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.context.event.EventListener;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -38,6 +40,8 @@ import org.springframework.data.domain.Sort;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -74,16 +78,17 @@ public class NoticeService {
     private static final int DEPT_ENRICH_LIMIT_PER_DEPARTMENT = 4;
     private static final int REQUEST_TIMEOUT_MILLIS = 10_000;
     private static final String CRAWLER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
-    private static final String ACCESS_DENIED_MESSAGE = "\uC811\uADFC \uAD8C\uD55C\uC774 \uC5C6\uC2B5\uB2C8\uB2E4.";
-    private static final String GENERAL_NOTICE_LABEL = "\uC77C\uBC18\uACF5\uC9C0";
-    private static final String ALL_BOARD_NOTICE_LABEL = "\uC804\uCCB4\uAC8C\uC2DC\uD310\uACF5\uC9C0";
-    private static final String ALL_POSTER_NOTICE_LABEL = "\uC804\uCCB4\uAC8C\uC2DC\uC790\uACF5\uC9C0";
-    private static final String SCHOOL_NOTICE_ACADEMIC = "\uD559\uC0AC";
-    private static final String SCHOOL_NOTICE_CREDIT_EXCHANGE = "\uD559\uC810\uAD50\uB958";
-    private static final String SCHOOL_NOTICE_GENERAL_EVENT_RECRUITING = "\uC77C\uBC18/\uD589\uC0AC/\uBAA8\uC9D1";
-    private static final String SCHOOL_NOTICE_SCHOLARSHIP = "\uC7A5\uD559\uAE08";
-    private static final String SCHOOL_NOTICE_TUITION = "\uB4F1\uB85D\uAE08\uB0A9\uBD80";
-    private static final String SCHOOL_NOTICE_EDUCATION_TEST = "\uAD50\uC721\uC2DC\uD5D8";
+    private static final String ACCESS_DENIED_MESSAGE = "접근 권한이 없습니다.";
+    private static final String GENERAL_NOTICE_LABEL = "일반공지";
+    private static final String ALL_BOARD_NOTICE_LABEL = "전체게시판공지";
+    private static final String ALL_POSTER_NOTICE_LABEL = "전체게시자공지";
+    private static final String SCHOOL_NOTICE_ACADEMIC = "학사";
+    private static final String SCHOOL_NOTICE_CREDIT_EXCHANGE = "학점교류";
+    private static final String SCHOOL_NOTICE_GENERAL_EVENT_RECRUITING = "일반/행사/모집";
+    private static final String SCHOOL_NOTICE_SCHOLARSHIP = "장학금";
+    private static final String SCHOOL_NOTICE_TUITION = "등록금 납부";
+    private static final String SCHOOL_NOTICE_EDUCATION_TEST = "교육시험";
+    private static final String SCHOOL_NOTICE_VOLUNTEER = "봉사";
     private static final String NO_LABEL = "NO";
     private static final int ERROR_MESSAGE_LIMIT = 500;
 
@@ -97,11 +102,11 @@ public class NoticeService {
     private final KeywordService keywordService;
     private final ObjectMapper objectMapper;
     private final ScheduleRepository scheduleRepository;
+    private final DepartmentNoticeScheduleExtractService scheduleExtractService;
 
     @Qualifier("localCacheManager")
     private final CacheManager localCacheManager;
 
-    private static long id = 0;
 
     public NoticeService(
             @Qualifier("cacheManager") CacheManager cacheManager,
@@ -111,7 +116,8 @@ public class NoticeService {
             DepartmentCrawlerStateRepository departmentCrawlerStateRepository,
             KeywordService keywordService,
             ObjectMapper objectMapper,
-            ScheduleRepository scheduleRepository
+            ScheduleRepository scheduleRepository,
+            DepartmentNoticeScheduleExtractService scheduleExtractService
     ) {
         this.noticeRepository = noticeRepository;
         this.departmentNoticeRepository = departmentNoticeRepository;
@@ -121,9 +127,10 @@ public class NoticeService {
         this.keywordService = keywordService;
         this.objectMapper = objectMapper;
         this.scheduleRepository = scheduleRepository;
+        this.scheduleExtractService = scheduleExtractService;
     }
 
-    @Scheduled(cron = "0 0/30 * * * *")
+    @Scheduled(cron = "0 0/15 * * * *")
     @CacheEvict(value = "noticeCache", cacheManager = "cacheManager")
     @Transactional
     public void getNewNotice() {
@@ -172,62 +179,133 @@ public class NoticeService {
 
     @Transactional
     public void crawlingNotices() {
-        id = 0;
-        noticeRepository.deleteAllInBatch();
-
-        getNoticeByCategory(1516, 46, SCHOOL_NOTICE_ACADEMIC);
-        getNoticeByCategory(1517, 47, SCHOOL_NOTICE_CREDIT_EXCHANGE);
-        getNoticeByCategory(1518, 611, SCHOOL_NOTICE_GENERAL_EVENT_RECRUITING);
-        getNoticeByCategory(1519, 49, SCHOOL_NOTICE_SCHOLARSHIP);
-        getNoticeByCategory(1520, 50, SCHOOL_NOTICE_TUITION);
-        getNoticeByCategory(1530, 52, SCHOOL_NOTICE_EDUCATION_TEST);
+        syncNoticesByCategory(246, SCHOOL_NOTICE_ACADEMIC, 100, true);
+        syncNoticesByCategory(247, SCHOOL_NOTICE_CREDIT_EXCHANGE, 100, true);
+        syncNoticesByCategory(2611, SCHOOL_NOTICE_GENERAL_EVENT_RECRUITING, 100, true);
+        syncNoticesByCategory(249, SCHOOL_NOTICE_SCHOLARSHIP, 100, true);
+        syncNoticesByCategory(250, SCHOOL_NOTICE_TUITION, 100, true);
+        syncNoticesByCategory(252, SCHOOL_NOTICE_EDUCATION_TEST, 100, true);
+        syncNoticesByCategory(253, SCHOOL_NOTICE_VOLUNTEER, 100, true);
     }
 
-    private void getNoticeByCategory(int category, int categoryNum, String categoryName) {
-        try {
-            String url = "https://www.inu.ac.kr/inu/" + category + "/subview.do?enc=";
-            int index = 1;
-            boolean outLoop = false;
+    @EventListener(ApplicationReadyEvent.class)
+    public void onApplicationReady() {
+        int[] categories = {246, 247, 2611, 249, 250, 252, 253};
+        String[] categoryNames = {
+                SCHOOL_NOTICE_ACADEMIC, SCHOOL_NOTICE_CREDIT_EXCHANGE, SCHOOL_NOTICE_GENERAL_EVENT_RECRUITING,
+                SCHOOL_NOTICE_SCHOLARSHIP, SCHOOL_NOTICE_TUITION, SCHOOL_NOTICE_EDUCATION_TEST, SCHOOL_NOTICE_VOLUNTEER
+        };
 
-            while (!outLoop) {
-                String postUrl = "fnct1|@@|%2Fbbs%2Finu%2F2" + categoryNum + "%2FartclList.do%3Fpage%3D" + index
-                        + "%26srchColumn%3D%26srchWrd%3D%26bbsClSeq%3D%26bbsOpenWrdSeq%3D%26rgsBgndeStr%3D%26rgsEnddeStr%3D%26isViewMine%3Dfalse%267";
-                String encodedUrl = url + encoding(postUrl);
-                Document document = connect(encodedUrl).get();
-                Elements notice = document.select("tr");
-
-                for (Element ele : notice) {
-                    if (NO_LABEL.equals(ele.select("th.th-num").text())) {
-                        continue;
-                    }
-                    if (isAMonthAgo(ele.select("td.td-date").text())) {
-                        outLoop = true;
-                        break;
-                    }
-
-                    String href = "www.inu.ac.kr" + ele.select("td.td-subject").select("a").attr("href");
-                    Pattern pattern = Pattern.compile("\\d+");
-                    Matcher matcher = pattern.matcher(href);
-                    matcher.find();
-                    matcher.find();
-                    String number = matcher.group();
-                    String baseUrl = "fnct1|@@|%2Fbbs%2Finu%2F2006%2F" + number
-                            + "%2FartclView.do%3Fpage%3D3%26srchColumn%3D%26srchWrd%3D%26bbsClSeq%3D%26bbsOpenWrdSeq%3D%26rgsBgndeStr%3D%26rgsEnddeStr%3D%26isViewMine%3Dfalse%26password%3D%267";
-
-                    noticeRepository.save(Notice.builder()
-                            .category(categoryName)
-                            .title(Objects.requireNonNull(Objects.requireNonNull(ele.select("td.td-subject").first()).selectFirst("strong").text()))
-                            .url("www.inu.ac.kr/inu/" + category + "/subview.do?enc=" + encoding(baseUrl))
-                            .writer(ele.select("td.td-write").text())
-                            .createDate(ele.select("td.td-date").text())
-                            .view(Long.parseLong(ele.select("td.td-access").text()))
-                            .id(++id)
-                            .build());
-                }
-                index++;
+        for (int i = 0; i < categories.length; i++) {
+            try {
+                syncNoticesByCategory(categories[i], categoryNames[i], 100, false);
+            } catch (Exception e) {
+                log.error("초기 공지 동기화 중 오류 발생: category={}, reason={}", categoryNames[i], e.getMessage());
             }
+        }
+        log.info("학교 공지 초기 크롤링 프로세스를 완료했습니다.");
+    }
+
+    private void syncNoticesByCategory(int categoryId, String categoryName, int rowSize, boolean shouldNotify) {
+        try {
+            log.info("[학교공지] 동기화 시작: category={}, categoryId={}", categoryName, categoryId); // 시작 로그
+
+            String rssUrl = "https://www.inu.ac.kr/bbs/inu/" + categoryId + "/rssList.do?row=" + rowSize;
+            Document document = Jsoup.connect(rssUrl)
+                    .userAgent(CRAWLER_USER_AGENT)
+                    .timeout(REQUEST_TIMEOUT_MILLIS)
+                    .parser(org.jsoup.parser.Parser.xmlParser())
+                    .get();
+
+            Elements items = document.select("item");
+            Set<String> activeUrls = new LinkedHashSet<>();
+            String oldestDate = null;
+            String newestDate = null;
+            int newCount = 0;
+            int updateCount = 0;
+
+            for (Element item : items) {
+                String title = item.select("title").text();
+                String link = item.select("link").text();
+                if (!link.startsWith("http")) {
+                    link = "https://www.inu.ac.kr" + link;
+                }
+                activeUrls.add(link);
+
+                String pubDateStr = item.select("pubDate").text();
+                String createDate = parseRssDate(pubDateStr);
+
+                if (oldestDate == null || createDate.compareTo(oldestDate) < 0) {
+                    oldestDate = createDate;
+                }
+                if (newestDate == null || createDate.compareTo(newestDate) > 0) {
+                    newestDate = createDate;
+                }
+
+                String writer = item.select("departmentName").text();
+                String subCategory = item.select("category").text();
+                String description = item.select("description").text();
+
+                Optional<Notice> existingNotice = noticeRepository.findByUrl(link);
+                if (existingNotice.isPresent()) {
+                    Notice notice = existingNotice.get();
+                    notice.update(subCategory, title, writer, description);
+                    updateCount++;
+                } else {
+                    Notice notice = noticeRepository.save(Notice.builder()
+                            .category(categoryName)
+                            .subCategory(subCategory)
+                            .title(title)
+                            .writer(writer)
+                            .createDate(createDate)
+                            .url(link)
+                            .description(description)
+                            .build());
+
+                    log.info("[학교공지] 새 공지 발견: [{}] {}", categoryName, title); // 개별 새 공지 로그
+                    newCount++;
+
+                    if (shouldNotify) {
+                        keywordService.noticeNotifyMatchedUsers(notice);
+                    }
+                }
+            }
+
+            if (oldestDate != null && newestDate != null) {
+                cleanupDeletedNotices(categoryName, oldestDate, newestDate, activeUrls);
+            }
+
+            log.info("[학교공지] 동기화 완료: category={}, 신규={}, 업데이트={}", categoryName, newCount, updateCount); // 요약 로그
+
         } catch (Exception e) {
-            log.warn("학교 공지 크롤링에 실패했습니다. category={}, reason={}", categoryName, e.getMessage());
+            log.error("[학교공지] 크롤링 중 에러 발생: category={}, message={}", categoryName, e.getMessage());
+        }
+    }
+
+    private void cleanupDeletedNotices(String categoryName, String oldestDate, String newestDate, Set<String> activeUrls) {
+        // 엄격한 범위 선정: oldestDate < date < newestDate
+        // 이 범위 안에 있는 공지인데 activeUrls에 없다면 100% 삭제된 것입니다.
+        // 경계선(oldestDate, newestDate와 동일한 날짜)은 지우지 않습니다.
+        List<Notice> dbNotices = noticeRepository.findAllByCategoryAndCreateDateGreaterThanAndCreateDateLessThan(categoryName, oldestDate, newestDate);
+        
+        List<Notice> toDelete = dbNotices.stream()
+                .filter(notice -> !activeUrls.contains(notice.getUrl()))
+                .collect(Collectors.toList());
+
+        if (!toDelete.isEmpty()) {
+            toDelete.forEach(n -> log.info("[학교공지] 삭제된 공지 제거: [{}] {}", categoryName, n.getTitle())); // 삭제 상세 로그
+            noticeRepository.deleteAllInBatch(toDelete);
+            log.info("[학교공지] 삭제 처리 완료: category={}, count={}", categoryName, toDelete.size());
+        }
+    }
+
+    private String parseRssDate(String pubDateStr) {
+        try {
+            DateTimeFormatter inputFormatter = DateTimeFormatter.RFC_1123_DATE_TIME;
+            LocalDateTime dateTime = LocalDateTime.parse(pubDateStr, inputFormatter);
+            return dateTime.format(DateTimeFormatter.ofPattern("yyyy.MM.dd"));
+        } catch (Exception e) {
+            return LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy.MM.dd"));
         }
     }
 
@@ -288,6 +366,18 @@ public class NoticeService {
         return notices;
     }
 
+    @Transactional(readOnly = true)
+    public ListResponseDto<NoticeListResponseDto> searchNotice(String query, String category, int page) {
+        Pageable pageable = PageRequest.of(page > 0 ? --page : page, 8, Sort.by(Sort.Direction.DESC, "createDate", "id"));
+        Page<Notice> notices = noticeRepository.searchNotices(query, category, pageable);
+
+        return ListResponseDto.of(
+                notices.getTotalPages(),
+                notices.getTotalElements(),
+                notices.getContent().stream().map(NoticeListResponseDto::of).collect(Collectors.toList())
+        );
+    }
+
     @Transactional
     public void crawlingDepartmentNotices(Department[] departments, int start, int end) {
         for (int i = start; i < end; i++) {
@@ -306,7 +396,8 @@ public class NoticeService {
                     ele -> !ele.select("strong.notice_icon").isEmpty(),
                     false,
                     List.of("#bo_v_con", ".bo_v_con", ".view_content", ".board_view"),
-                    List.of("#bo_v_file a[href]", ".view_file_download")
+                    List.of("#bo_v_file a[href]", ".view_file_download"),
+                    ".if_date"
             );
         }
 
@@ -421,7 +512,8 @@ public class NoticeService {
                     }
 
                     String title = ele.select(config.getTitleSelector()).text();
-                    String date = ele.select(config.getDateSelector()).text();
+                    String dateStr = ele.select(config.getDateSelector()).text();
+                    LocalDate date = parseDepartmentNoticeDate(dateStr);
                     String href = resolveDepartmentNoticeUrl(ele.selectFirst(config.getLinkSelector()), url, config.isUseAbsoluteHref());
                     long views = parseLongValue(ele.select(config.getViewsSelector()).text());
 
@@ -446,8 +538,16 @@ public class NoticeService {
                     syncDepartmentNoticeContent(departmentNotice, config);
 
                     if (isNewNotice) {
-                        keywordService.departmentNotifyMatchedUsers(departmentNotice, department);
-                        keywordService.departmentNotifyMatchedUsersAndKeyword(departmentNotice, department);
+                        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+                            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                                @Override
+                                public void afterCommit() {
+                                    scheduleExtractService.extractScheduleAsync(departmentNotice, true);
+                                }
+                            });
+                        } else {
+                            scheduleExtractService.extractScheduleAsync(departmentNotice, true);
+                        }
                     }
 
                     count++;
@@ -477,6 +577,15 @@ public class NoticeService {
                 log.info("접근 권한 제한으로 학과 공지 본문 크롤링을 건너뜁니다. department={}, url={}",
                         departmentNotice.getDepartment().name(), departmentNotice.getUrl());
                 return;
+            }
+
+            // 상세 페이지에서 날짜 정보가 있는 경우 업데이트 (예: SPORTS_SCIENCE 처럼 리스트 날짜가 불완전한 경우)
+            if (config.getDetailDateSelector() != null) {
+                String detailDateStr = detailDocument.select(config.getDetailDateSelector()).text();
+                if (!detailDateStr.isBlank()) {
+                    LocalDate detailDate = parseDepartmentNoticeDate(detailDateStr);
+                    departmentNotice.updateListing(departmentNotice.getTitle(), detailDate, departmentNotice.getView(), departmentNotice.getUrl());
+                }
             }
 
             Element contentRoot = findDepartmentNoticeContentRoot(detailDocument, config);
@@ -531,8 +640,7 @@ public class NoticeService {
             List<String> inlineImageUrls,
             List<AttachmentMeta> attachmentMetas
     ) {
-        String mergedText = mergeTexts(contentText, departmentNotice.getAttachmentText(), departmentNotice.getOcrText());
-        departmentNotice.updateEnrichmentTexts(departmentNotice.getOcrText(), departmentNotice.getAttachmentText(), mergedText);
+        departmentNotice.updateEnrichmentTexts(departmentNotice.getOcrText(), departmentNotice.getAttachmentText());
 
         boolean hasBaseText = !normalizeText(contentText).isBlank();
         boolean hasParsableAttachments = attachmentMetas.stream().anyMatch(this::isParsableAttachment);
@@ -598,10 +706,9 @@ public class NoticeService {
             }
 
             String attachmentText = mergeTexts(extractedTexts);
-            String mergedText = mergeTexts(departmentNotice.getContentText(), attachmentText, departmentNotice.getOcrText());
-            departmentNotice.updateEnrichmentTexts(departmentNotice.getOcrText(), attachmentText, mergedText);
+            departmentNotice.updateEnrichmentTexts(departmentNotice.getOcrText(), attachmentText);
 
-            if (!normalizeText(mergedText).isBlank()) {
+            if (!departmentNotice.getMergedText().isBlank()) {
                 departmentNotice.markContentSuccess();
                 return;
             }
@@ -620,10 +727,9 @@ public class NoticeService {
     }
 
     private void finalizeNoticeWithoutAttachmentParse(DepartmentNotice departmentNotice, boolean hasImageAssets) {
-        String mergedText = mergeTexts(departmentNotice.getContentText(), departmentNotice.getAttachmentText(), departmentNotice.getOcrText());
-        departmentNotice.updateEnrichmentTexts(departmentNotice.getOcrText(), departmentNotice.getAttachmentText(), mergedText);
+        departmentNotice.updateEnrichmentTexts(departmentNotice.getOcrText(), departmentNotice.getAttachmentText());
 
-        if (!normalizeText(mergedText).isBlank()) {
+        if (!departmentNotice.getMergedText().isBlank()) {
             departmentNotice.markContentSuccess();
             return;
         }
@@ -882,7 +988,8 @@ public class NoticeService {
     private Connection connect(String url) {
         return Jsoup.connect(url)
                 .userAgent(CRAWLER_USER_AGENT)
-                .timeout(REQUEST_TIMEOUT_MILLIS);
+                .timeout(REQUEST_TIMEOUT_MILLIS)
+                .maxBodySize(0);
     }
 
     private boolean containsAccessDenied(Document document) {
@@ -906,22 +1013,46 @@ public class NoticeService {
         return Long.parseLong(digits);
     }
 
-    private String encoding(String baseUrl) {
-        return Base64.getEncoder().encodeToString(baseUrl.getBytes(StandardCharsets.UTF_8));
+    private LocalDate parseDepartmentNoticeDate(String dateStr) {
+        String normalized = normalizeText(dateStr);
+        if (normalized.isBlank()) {
+            return LocalDate.now();
+        }
+
+        // 공백 및 시간 정보 제거 (예: "25-03-05 10:00" -> "25-03-05")
+        String dateOnly = normalized.split(" ")[0];
+
+        try {
+            // 1. yyyy.MM.dd 형식
+            if (dateOnly.matches("\\d{4}\\.\\d{2}\\.\\d{2}")) {
+                return LocalDate.parse(dateOnly, DateTimeFormatter.ofPattern("yyyy.MM.dd"));
+            }
+            // 2. yy-MM-dd 형식 (그누보드 상세 페이지 등)
+            if (dateOnly.matches("\\d{2}-\\d{2}-\\d{2}")) {
+                return LocalDate.parse(dateOnly, DateTimeFormatter.ofPattern("yy-MM-dd"));
+            }
+            // 3. MM-dd 형식 (그누보드 목록 등)
+            if (dateOnly.matches("\\d{2}-\\d{2}")) {
+                String year = String.valueOf(LocalDate.now().getYear());
+                return LocalDate.parse(year + "-" + dateOnly, DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+            }
+            // 4. yyyy-MM-dd 형식
+            if (dateOnly.matches("\\d{4}-\\d{2}-\\d{2}")) {
+                return LocalDate.parse(dateOnly, DateTimeFormatter.ISO_LOCAL_DATE);
+            }
+            
+            log.warn("정의되지 않은 날짜 형식입니다. value={}", normalized);
+            return LocalDate.now();
+        } catch (Exception e) {
+            log.warn("학과 공지 날짜 파싱에 실패했습니다. value={}, reason={}", normalized, e.getMessage());
+            return LocalDate.now();
+        }
     }
 
-    private boolean isAMonthAgo(String date) {
-        LocalDate currentDate = LocalDate.now();
-        LocalDate formedDate = LocalDate.parse(date, DateTimeFormatter.ofPattern("yyyy.MM.dd"));
-        LocalDate oneMonthAgo = currentDate.minusMonths(1);
-        return formedDate.isBefore(oneMonthAgo);
-    }
 
     private Sort sort(String sort) {
-        if (sort.equals("date")) {
+        if ("date".equals(sort)) {
             return Sort.by(Sort.Direction.DESC, "createDate", "id");
-        } else if (sort.equals("view")) {
-            return Sort.by(Sort.Direction.DESC, "view", "id");
         } else {
             throw new MyException(MyErrorCode.WRONG_SORT_TYPE);
         }
